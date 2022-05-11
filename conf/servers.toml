@@ -1,0 +1,17 @@
+[shared]
+dbname = 'ring'
+
+[server.a]
+host = "localhost"
+port = 12301
+https = false
+
+[server.b]
+host = "localhost"
+port = 12302
+https = false
+
+[server.c]
+host = "localhost"
+port = 12303
+https = false
