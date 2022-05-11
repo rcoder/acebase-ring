@@ -35,7 +35,10 @@ if (serverName === undefined) {
     process.exit(1);
 }
 
-const serverConfig = config.server[serverName];
+const serverConfig = {
+    logLevel: 'warn',
+    ...config.server[serverName]
+};
 
 console.log({ servers: Object.keys(config.server) });
 
@@ -57,7 +60,10 @@ const server = new AceBaseServer(`ring`, {
     ...serverConfig
 });
 
-const local = new AceBase(`${dbname}_local`, { storage: storageOptions });
+const local = new AceBase(`${dbname}_local`, {
+    logLevel: config.shared.logLevel,
+    storage: storageOptions,
+});
 
 const clientConfig = {
     dbname,
@@ -67,89 +73,81 @@ const clientConfig = {
 
 const client = new AceBaseClient(clientConfig);
 
-type CacheEntry = {
-    key: string,
-    client: AceBaseClient,
-};
-
-const ring = new HashRing<CacheEntry>();
+const ring = new HashRing();
 const connections: Map<string, AceBaseClient> = new Map();
 const removed: Set<string> = new Set();
 
-let clientCache: {[K: string]: CacheEntry} = {};
+const connectTo = async (key: string) => {
+    if (connections.has(key)) {
+        return connections.get(key);
+    }
+
+    const conf = config.server[key];
+
+    const client = new AceBaseClient({ dbname, ...conf });
+
+    client.on('disconnect', () => {
+        console.log(`server '${key}' connection lost; removing from ring`);
+        ring.removeNode(key);
+        connections.delete(key);
+        removed.add(key);
+    });
+
+    client.ready().then(() => {
+        console.log(`connected to server '${key}'`);
+        ring.addNode(key);
+        connections.set(key, client);
+    }).catch((err) => {
+        console.log(`failed to connect to server '${key}'`, { err });
+    });
+
+    return client;
+}
 
 const buildRing = async () => {
     const serverNames = Object.keys(config.server);
 
     for (let key of serverNames) {
         if (key == serverName) continue;
-        if (connections.has(key)) continue;
-
-        const conf = config.server[key];
-
-        const client = new AceBaseClient({ dbname, ...conf });
-
-        const cacheEntry = { key, client };
-
-        client.on('disconnect', () => {
-            console.log(`server '${cacheEntry.key}' connection lost; removing from ring`);
-            ring.removeNode(cacheEntry);
-            connections.delete(key);
-            removed.add(key);
-        });
-
-        client.ready().then(() => {
-            console.log(`connected to server '${cacheEntry.key}'`);
-            ring.addNode(cacheEntry);
-            connections.set(key, client);
-        }).catch((err) => {
-            console.log(`failed to connect to server '${key}'`, { err });
-        });
+        connectTo(serverName);
     }
 }
 
-const checkRemoved = async () => {
-    console.log(`checkRemoved:begin`, { removed });
+const checkRemoved = () => {
     for (let key in removed) {
-        try {
-            const sc = config.server[key]!;
-            const client = new AceBaseClient({ dbname, ...sc });
-            await client.ready();
-
-            ring.addNode({ key, client });
-            removed.delete(key);
-            console.info(`reconnected to server '${key}'`);
-        } catch (err) {
-            console.error(`failed to reconnect to server '${key}'`, { err });
-        }
+        connectTo(key)
+            .then(() => {
+                removed.delete(key)
+            })
+            .catch(async (err: any) => {
+                await logMsg(`connection failed`, { key, err })
+            });
     }
-    console.log(`checkRemoved:end`, { removed });
 }
 
 const RING_CHECK_INTERVAL = 5000;
 setInterval(checkRemoved, RING_CHECK_INTERVAL);
 
 const replicaFor = async (root: string) => {
-    let cacheEntry = clientCache[root];
-    let client: AceBaseClient | undefined = cacheEntry?.client;
+    const upstream = ring.getNode(root);
+    let conn: AceBaseClient | undefined;
 
-    if (client === undefined) {
-        console.log(`no cached connection for '${root}'; trying next host`);
-        const upstream = ring.getNode(root);
-
-        if (upstream === undefined) {
-            console.error(`all peer nodes down!`);
-        } else {
-            console.debug(`connecting to '${upstream.key}'`);
-            client = upstream!.client;
-            clientCache[root] = upstream;
-        }
+    if (upstream === undefined) {
+        await logMsg(`all peer nodes marked down`, { ring });
+    } else {
+        conn = await connectTo(upstream);
     }
 
-    return client;
+    return conn;
 }
 
-const testRing = async () => {
+const SAMPLE_RATE = 0.1;
+const SAMPLE_COUNT = 100;
+
+type Sample = { path: string, inner: { msg: string, ts: Date } };
+let sampledValues: Sample[] = [];
+
+const populateRing = async () => {
     await buildRing();
 
     await server.ready();
@@ -164,27 +162,59 @@ const testRing = async () => {
         const ref = client.ref(objPath).push();
         await ref.set(msg);
 
+        if (Math.random() < SAMPLE_RATE) {
+            sampledValues.push({ path: objPath, inner: msg });
+            sampledValues = [...sampledValues].slice(-SAMPLE_COUNT);
+        }
+
         const upstream = await replicaFor(objPath);
 
         if (upstream === undefined) {
-            console.error(`failed to get replica for '${obj}'`);
+            await logMsg(`failed to get replica for '${obj}'`, {});
             failure += 1;
         } else {
-            try {
-                await upstream.ref(ref.path).set(msg);
-                success += 1;
-            } catch (err) {
-                console.error(`failed to update '${obj}' on peer`);
-                failure += 1;
-            }
+            upstream.ref(ref.path)
+                .set(msg)
+                .then(() => { success += 1; })
+                .catch(async (err: any) => {
+                    await logMsg(`failed to update '${obj}' on peer`, {});
+                    failure += 1;
+                });
         }
     }
 
-    console.info(`test finished; ${success} updates okay, ${failure} failed`);
     const count = await client.ref('/test').count();
-    const localCount = await local.ref('/test').count();
-    console.info(`${count} total objects in server db (${localCount} in cache)`);
+    const localCount = await local.ref('/ring/cache/test').count();
+
+    await logMsg(`new records added`, {
+        success,
+        failure,
+        count,
+        localCount,
+    });
 }
 
-const timer = setInterval(testRing, 5000);
-timer.unref();
+const logMsg = async (msg: string, extra: any) => {
+    await fs.appendFile(
+        `data/ring_test/${serverName}/report.ndjson`,
+        `${JSON.stringify({ msg, ...extra })}\n`,
+        console.log,
+    );
+}
+
+const testRing = async () => {
+    for (let sample of sampledValues) {
+        const { path, inner } = sample;
+        const proxy = await client.ref(path).proxy();
+        const val = await proxy.value;
+        const vmsg = val.msg;
+        const imsg = inner.msg;
+
+        if (imsg != vmsg) {
+            await logMsg(`mismatched sample value for '${sample.path}`, { path, imsg, vmsg });
+        }
+    }
+}
+
+setInterval(populateRing, (1+Math.random()/10)*5000);
+setInterval(testRing, (1+Math.random()/10)*5000);
